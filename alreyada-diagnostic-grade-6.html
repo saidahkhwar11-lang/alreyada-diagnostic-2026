@@ -187,7 +187,8 @@ function shuffledQuestions(){
   const offset=Math.floor(Math.random()*4);
   a=a.map((q,idx)=>{
     const originalCorrectIndex=q.answer.charCodeAt(0)-65;
-    const targetCorrectIndex=(idx+offset)%4;
+    const choiceCount=q.options.length;
+    const targetCorrectIndex=(idx+offset)%choiceCount;
     const correctText=q.options[originalCorrectIndex];
     const distractors=q.options.filter((_,i)=>i!==originalCorrectIndex);
 
@@ -199,7 +200,7 @@ function shuffledQuestions(){
 
     const opts=[];
     let d=0;
-    for(let i=0;i<q.options.length;i++){
+    for(let i=0;i<choiceCount;i++){
       if(i===targetCorrectIndex) opts.push(correctText);
       else opts.push(distractors[d++]);
     }
