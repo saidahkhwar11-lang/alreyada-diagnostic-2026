@@ -17,6 +17,7 @@ const TEST={"title":"Alreyada School English Diagnostic Test 2026","sections":[{
 const ROOT=`teacherControlCenter/diagnosticByGrade/grade${GRADE}`;
 const MAX_STUDENTS=35,USER='teacher9',PASS='diagnostic2026';
 let classes={},participants={},results={},student=null,questions=[],answers={},current=0,selectedClassId=null;
+let lockdownActive=false, lockdownViolations=0, lockdownLocked=false, lastViolationAt=0;
 const $=id=>document.getElementById(id); const safe=s=>String(s||'').trim().toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_|_$/g,'');
 function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]))}
 function hide(){['home','teacherLogin','teacherApp','studentLogin','studentApp'].forEach(x=>$(x).classList.add('hidden'))}
@@ -176,11 +177,157 @@ function exportAll(){
 
 async function studentJoin(){const name=$('sn').value.trim(),studentId=$('sid').value.trim(),code=$('sc').value.trim().toUpperCase();$('smsg').textContent='';if(name.split(/\s+/).length<2)return $('smsg').textContent='Please enter your full name.';if(!/^\d{4,20}$/.test(studentId))return $('smsg').textContent='Please enter a valid student ID number.';if(!db)return $('smsg').textContent='Database connection is unavailable.';try{const cs=await db.ref(`${ROOT}/classCodes/${code}`).get();if(!cs.exists())return $('smsg').textContent='Class code not found.';const info=cs.val();if(!info.active)return $('smsg').textContent='This class test is not active.';const cid=info.classId,key=safe(studentId);const ps=await db.ref(`${ROOT}/participants/${cid}`).get(),pv=ps.val()||{};if(!pv[key]&&Object.keys(pv).length>=MAX_STUDENTS)return $('smsg').textContent='This class already has 35 students.';await db.ref(`${ROOT}/participants/${cid}/${key}`).update({name,studentId,joinedAt:Date.now()});student={name,studentId,key,cid,className:info.className,code};sessionStorage.setItem('diagStudentG'+GRADE,JSON.stringify(student));renderStudentLanding()}catch(e){console.error(e);$('smsg').textContent='Could not join this class. '+(e?.message||e)}}
 async function renderStudentLanding(){hide();$('studentApp').classList.remove('hidden');const rs=await db.ref(`${ROOT}/results/${student.cid}/${student.key}`).get(),r=rs.val();$('testArea').classList.add('hidden');$('resultArea').classList.add('hidden');$('landing').classList.remove('hidden');if(r){$('landing').innerHTML=`<span class="eyebrow">Grade ${GRADE} Diagnostic Completed</span><h1>Your official result is saved.</h1><div class="score-big">${r.score}/100</div><span class="level lv${r.level}">Level ${r.level}</span><p>${esc(levelFor(r.score).m)}</p>`;return}$('landing').innerHTML=`<span class="eyebrow">Grade ${GRADE} • 100 Marks</span><h1>${esc(TEST.title)}</h1><p>Basic Grammar 25 • Vocabulary 25 • Context Clues 20 • Reading 30</p><div class="muted tiny">34 questions • Includes two reading texts</div><div class="notice"><b>${esc(student.name)}</b> • ID ${esc(student.studentId)} • ${esc(student.className)} • Code ${esc(student.code)}</div><button class="primary" onclick="startTest()">Start Diagnostic</button>`}
-function shuffledQuestions(){let a=[];TEST.sections.forEach(s=>s.questions.forEach(q=>{const opts=q.options.map((t,i)=>({t,correct:String.fromCharCode(65+i)===q.answer})).sort(()=>Math.random()-.5);a.push({...q,options:opts.map(x=>x.t),answer:String.fromCharCode(65+opts.findIndex(x=>x.correct))})}));return a}
-function startTest(){questions=shuffledQuestions();answers={};current=0;$('landing').classList.add('hidden');$('testArea').classList.remove('hidden');renderQ()}
+function shuffledQuestions(){
+  let a=[];
+  TEST.sections.forEach(s=>s.questions.forEach(q=>a.push({...q})));
+
+  // Balance the correct-answer positions across A, B, C and D.
+  // A random offset means each student receives a different pattern,
+  // while preventing the whole test from accidentally becoming mostly A/B/etc.
+  const offset=Math.floor(Math.random()*4);
+  a=a.map((q,idx)=>{
+    const originalCorrectIndex=q.answer.charCodeAt(0)-65;
+    const targetCorrectIndex=(idx+offset)%4;
+    const correctText=q.options[originalCorrectIndex];
+    const distractors=q.options.filter((_,i)=>i!==originalCorrectIndex);
+
+    // Shuffle distractors only.
+    for(let i=distractors.length-1;i>0;i--){
+      const j=Math.floor(Math.random()*(i+1));
+      [distractors[i],distractors[j]]=[distractors[j],distractors[i]];
+    }
+
+    const opts=[];
+    let d=0;
+    for(let i=0;i<4;i++){
+      if(i===targetCorrectIndex) opts.push(correctText);
+      else opts.push(distractors[d++]);
+    }
+
+    return {...q,options:opts,answer:String.fromCharCode(65+targetCorrectIndex)};
+  });
+
+  return a;
+}
+
+async function requestExamFullscreen(){
+  try{
+    if(!document.fullscreenElement && document.documentElement.requestFullscreen){
+      await document.documentElement.requestFullscreen();
+    }
+  }catch(e){
+    console.warn('Fullscreen request was not accepted.',e);
+  }
+}
+
+function startLockdown(){
+  lockdownActive=true;
+  lockdownViolations=0;
+  lockdownLocked=false;
+  lastViolationAt=0;
+  sessionStorage.setItem('diagLockViolationsG'+GRADE,'0');
+  requestExamFullscreen();
+}
+
+function stopLockdown(){
+  lockdownActive=false;
+  lockdownLocked=false;
+  sessionStorage.removeItem('diagLockViolationsG'+GRADE);
+  const overlay=document.getElementById('lockdownOverlay');
+  if(overlay) overlay.remove();
+  try{
+    if(document.fullscreenElement && document.exitFullscreen) document.exitFullscreen();
+  }catch(e){}
+}
+
+function registerViolation(reason){
+  if(!lockdownActive || lockdownLocked) return;
+
+  // Prevent the same tab/fullscreen event from being counted twice.
+  const now=Date.now();
+  if(now-lastViolationAt<1200) return;
+  lastViolationAt=now;
+
+  lockdownViolations++;
+  sessionStorage.setItem('diagLockViolationsG'+GRADE,String(lockdownViolations));
+
+  if(lockdownViolations>=3){
+    lockdownLocked=true;
+    showLockdownOverlay(reason);
+    return;
+  }
+
+  alert(`Exam warning ${lockdownViolations}/3: You left the exam screen (${reason}). Please stay on the test page. After 3 violations the test will lock.`);
+  requestExamFullscreen();
+}
+
+function showLockdownOverlay(reason){
+  let overlay=document.getElementById('lockdownOverlay');
+  if(!overlay){
+    overlay=document.createElement('div');
+    overlay.id='lockdownOverlay';
+    overlay.className='modal';
+    overlay.innerHTML=`<div class="card modal-card" style="text-align:center">
+      <span class="eyebrow">Exam Locked</span>
+      <h2>This diagnostic test has been locked.</h2>
+      <p>The exam screen was left 3 times. Please ask your teacher to unlock it.</p>
+      <div class="notice danger-note" id="lockReason"></div>
+      <div class="actions" style="justify-content:center">
+        <button class="primary" onclick="teacherUnlockExam()">Teacher Unlock</button>
+      </div>
+    </div>`;
+    document.body.appendChild(overlay);
+  }
+  const r=document.getElementById('lockReason');
+  if(r) r.textContent='Last detected action: '+reason;
+}
+
+function teacherUnlockExam(){
+  const p=prompt('Teacher password required to unlock this test:');
+  if(p!==PASS){
+    alert('Incorrect teacher password.');
+    return;
+  }
+  lockdownLocked=false;
+  lockdownViolations=0;
+  lastViolationAt=Date.now();
+  sessionStorage.setItem('diagLockViolationsG'+GRADE,'0');
+  const overlay=document.getElementById('lockdownOverlay');
+  if(overlay) overlay.remove();
+  requestExamFullscreen();
+  alert('Test unlocked. The student may continue.');
+}
+
+function startTest(){
+  questions=shuffledQuestions();
+  answers={};
+  current=0;
+  $('landing').classList.add('hidden');
+  $('testArea').classList.remove('hidden');
+  startLockdown();
+  renderQ();
+}
 function renderQ(){const q=questions[current];$('meta').textContent=`Grade ${GRADE} • Question ${current+1} of ${questions.length}`;$('bar').style.width=((current+1)/questions.length*100)+'%';$('passage').innerHTML=q.context?`<div class="reading">${esc(q.context)}</div>`:'<div class="notice">Read carefully and choose the best answer.</div>';$('qbox').innerHTML=`<div class="question">${q.prompt.replace(/\*\*(.*?)\*\*/g,'<b>$1</b>')}</div>${q.options.map((o,i)=>{const L=String.fromCharCode(65+i);return `<label class="option"><input type="radio" name="a" value="${L}" ${answers[current]===L?'checked':''} onchange="answers[current]='${L}'"><b>${L}.</b> ${esc(o)}</label>`}).join('')}`;$('prev').disabled=current===0;$('next').classList.toggle('hidden',current===questions.length-1);$('submit').classList.toggle('hidden',current!==questions.length-1)}
 function nextQ(){if(current<questions.length-1){current++;renderQ()}} function prevQ(){if(current>0){current--;renderQ()}}
-async function submitTest(){if(Object.keys(answers).length<questions.length)return alert('Please answer all questions before submitting.');if(!confirm('Submit your official diagnostic test?'))return;let score=0,skills={Grammar:0,Vocabulary:0,Context:0,Reading:0};questions.forEach((q,i)=>{if(answers[i]===q.answer){score+=q.points;if(q.skill==='Basic Grammar')skills.Grammar+=q.points;else if(q.skill==='Vocabulary')skills.Vocabulary+=q.points;else if(q.skill==='Context Clues')skills.Context+=q.points;else skills.Reading+=q.points}});const lv=levelFor(score),path=`${ROOT}/results/${student.cid}/${student.key}`,old=await db.ref(path).get();if(!old.exists())await db.ref(path).set({studentName:student.name,studentId:student.studentId,className:student.className,classCode:student.code,grade:GRADE,score,total:100,percentage:score,level:lv.c,skills,completedAt:Date.now(),placementOnly:true});$('testArea').classList.add('hidden');$('resultArea').classList.remove('hidden');$('resultArea').innerHTML=`<span class="eyebrow">Official Result</span><h1>Grade ${GRADE} English Diagnostic</h1><div class="score-big">${score}/100</div><span class="level lv${lv.c}">Level ${lv.c}</span><p>${esc(lv.m)}</p><div class="result-grid"><div class="result-item"><b>Grammar</b><div>${skills.Grammar}/25</div></div><div class="result-item"><b>Vocabulary</b><div>${skills.Vocabulary}/25</div></div><div class="result-item"><b>Context</b><div>${skills.Context}/20</div></div><div class="result-item"><b>Reading</b><div>${skills.Reading}/30</div></div></div><div class="notice success-note">Saved automatically under ${esc(student.className)} in the Grade ${GRADE} teacher page.</div>`}
-function studentExit(){sessionStorage.removeItem('diagStudentG'+GRADE);student=null;home()}
+async function submitTest(){if(Object.keys(answers).length<questions.length)return alert('Please answer all questions before submitting.');if(!confirm('Submit your official diagnostic test?'))return;stopLockdown();let score=0,skills={Grammar:0,Vocabulary:0,Context:0,Reading:0};questions.forEach((q,i)=>{if(answers[i]===q.answer){score+=q.points;if(q.skill==='Basic Grammar')skills.Grammar+=q.points;else if(q.skill==='Vocabulary')skills.Vocabulary+=q.points;else if(q.skill==='Context Clues')skills.Context+=q.points;else skills.Reading+=q.points}});const lv=levelFor(score),path=`${ROOT}/results/${student.cid}/${student.key}`,old=await db.ref(path).get();if(!old.exists())await db.ref(path).set({studentName:student.name,studentId:student.studentId,className:student.className,classCode:student.code,grade:GRADE,score,total:100,percentage:score,level:lv.c,skills,completedAt:Date.now(),placementOnly:true});$('testArea').classList.add('hidden');$('resultArea').classList.remove('hidden');$('resultArea').innerHTML=`<span class="eyebrow">Official Result</span><h1>Grade ${GRADE} English Diagnostic</h1><div class="score-big">${score}/100</div><span class="level lv${lv.c}">Level ${lv.c}</span><p>${esc(lv.m)}</p><div class="result-grid"><div class="result-item"><b>Grammar</b><div>${skills.Grammar}/25</div></div><div class="result-item"><b>Vocabulary</b><div>${skills.Vocabulary}/25</div></div><div class="result-item"><b>Context</b><div>${skills.Context}/20</div></div><div class="result-item"><b>Reading</b><div>${skills.Reading}/30</div></div></div><div class="notice success-note">Saved automatically under ${esc(student.className)} in the Grade ${GRADE} teacher page.</div>`}
+function studentExit(){stopLockdown();sessionStorage.removeItem('diagStudentG'+GRADE);student=null;home()}
+
+document.addEventListener('visibilitychange',()=>{
+  if(lockdownActive && document.hidden) registerViolation('tab or app change');
+});
+
+document.addEventListener('fullscreenchange',()=>{
+  if(lockdownActive && !document.fullscreenElement && !lockdownLocked){
+    registerViolation('fullscreen exited');
+  }
+});
+
+window.addEventListener('beforeunload',e=>{
+  if(lockdownActive){
+    e.preventDefault();
+    e.returnValue='';
+  }
+});
+
 window.addEventListener('load',()=>{if(sessionStorage.getItem('diagTeacherG'+GRADE)==='1')loadTeacher();else{try{student=JSON.parse(sessionStorage.getItem('diagStudentG'+GRADE)||'null')}catch{}if(student)renderStudentLanding();else home()}})
 </script></body></html>
